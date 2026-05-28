@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import sqlite3
 from pathlib import Path
+import io
 
 import numpy as np
 import pandas as pd
@@ -40,9 +41,13 @@ def find_data_file() -> Path | None:
 
 
 @st.cache_data(show_spinner=False)
-def load_sales_data(csv_path: str) -> pd.DataFrame:
-    """Load and standardize the sales dataset."""
-    frame = pd.read_csv(csv_path, low_memory=False)
+def load_sales_data(csv_path_or_buffer, date_column: str | None = None) -> pd.DataFrame:
+    """Load and standardize the sales dataset.
+
+    Accepts a file path or a file-like buffer (Streamlit upload).
+    """
+    # pandas can accept file-like objects directly
+    frame = pd.read_csv(csv_path_or_buffer, low_memory=False)
 
     # Remove columns that are completely empty and normalize column names.
     frame = frame.dropna(axis=1, how="all")
@@ -123,6 +128,51 @@ def load_sales_data(csv_path: str) -> pd.DataFrame:
     frame["sku"] = frame.get("sku", pd.Series(dtype="object")).fillna("Unknown")
 
     # Parse date and numeric fields.
+    # If caller provided a specific date column, prefer it
+    if date_column and "order_date" not in frame.columns:
+        if date_column in frame.columns:
+            frame = frame.rename(columns={date_column: "order_date"})
+        else:
+            # try case-insensitive match
+            lower_map = {c.lower(): c for c in frame.columns}
+            if date_column.lower() in lower_map:
+                actual = lower_map[date_column.lower()]
+                frame = frame.rename(columns={actual: "order_date"})
+            else:
+                # try normalized match (remove non-alphanum)
+                def _norm(s: str) -> str:
+                    return re.sub(r"[^a-z0-9]+", "", str(s).lower())
+
+                norm_map = {_norm(c): c for c in frame.columns}
+                if _norm(date_column) in norm_map:
+                    actual = norm_map[_norm(date_column)]
+                    frame = frame.rename(columns={actual: "order_date"})
+
+    # Ensure `order_date` exists: try common names or detect the best date-like column
+    if "order_date" not in frame.columns:
+        # prefer any column containing 'date'
+        candidates = [c for c in frame.columns if "date" in c]
+        if candidates:
+            frame = frame.rename(columns={candidates[0]: "order_date"})
+        else:
+            # heuristic: find the column with the most parseable datetimes
+            best_col = None
+            best_count = 0
+            for col in frame.columns:
+                try:
+                    parsed = pd.to_datetime(frame[col], errors="coerce")
+                    count = int(parsed.notna().sum())
+                    if count > best_count:
+                        best_count = count
+                        best_col = col
+                except Exception:
+                    continue
+            if best_col is not None and best_count >= max(1, int(0.1 * len(frame))):
+                frame = frame.rename(columns={best_col: "order_date"})
+
+    if "order_date" not in frame.columns:
+        raise ValueError(f"Could not find a date column to use as 'order_date'. Available columns: {', '.join(frame.columns)}")
+
     frame["order_date"] = pd.to_datetime(frame["order_date"], errors="coerce")
     frame["qty"] = pd.to_numeric(frame.get("qty"), errors="coerce").fillna(0).astype(int)
     frame["amount"] = pd.to_numeric(frame.get("amount"), errors="coerce").fillna(0.0)
@@ -149,9 +199,15 @@ def load_sales_data(csv_path: str) -> pd.DataFrame:
 
 
 @st.cache_resource
-def get_master_connection(csv_path: str) -> tuple[pd.DataFrame, sqlite3.Connection]:
-    """Create a single master SQLite database connection on startup to avoid expensive file writes."""
-    frame = load_sales_data(csv_path)
+def get_master_connection(csv_path_or_buffer, date_column: str | None = None) -> tuple[pd.DataFrame, sqlite3.Connection]:
+    """Create a single master SQLite database connection on startup to avoid expensive file writes.
+
+    Accepts either a path-like, a file-like buffer, or a pre-loaded DataFrame.
+    """
+    if isinstance(csv_path_or_buffer, pd.DataFrame):
+        frame = csv_path_or_buffer.copy()
+    else:
+        frame = load_sales_data(csv_path_or_buffer, date_column=date_column)
     connection = sqlite3.connect(":memory:", check_same_thread=False)
     analytics_frame = frame.copy()
     analytics_frame["order_date"] = analytics_frame["order_date"].dt.strftime("%Y-%m-%d")
@@ -249,15 +305,39 @@ def calculate_rfm(df, end_date):
     return rfm
 
 
-# Load Master Connection
-DATA_PATH = find_data_file()
+# Allow users to upload their own CSV via the sidebar (overrides default file)
+uploaded_file = st.sidebar.file_uploader("Upload your sales CSV (optional)", type=["csv"], help="Upload a CSV file to analyze. If not provided, the sample dataset will be used.")
 
-if DATA_PATH is None:
-    st.error("Amazon Sale Report.csv was not found. Place it in e-commerce-analytics/dataset/ or keep it in the workspace root.")
-    st.stop()
+# Load Master Connection (uploaded file takes precedence over bundled sample)
+if uploaded_file is not None:
+    # Preview the uploaded file to let the user pick the date column
+    try:
+        uploaded_file.seek(0)
+    except Exception:
+        pass
+    preview_df = pd.read_csv(uploaded_file, nrows=5)
+    cols = preview_df.columns.tolist()
+    # choose a sensible default (first column containing 'date')
+    default_idx = 0
+    for i, c in enumerate(cols):
+        if "date" in c.lower():
+            default_idx = i
+            break
+    selected_date_col = st.sidebar.selectbox("Select date column for analysis", options=cols, index=default_idx, help="Pick the column that contains the order date/time")
+    try:
+        uploaded_file.seek(0)
+    except Exception:
+        pass
+    raw_data, connection = get_master_connection(uploaded_file, date_column=selected_date_col)
+else:
+    DATA_PATH = find_data_file()
 
-# Initialize data and sqlite db connection
-raw_data, connection = get_master_connection(str(DATA_PATH))
+    if DATA_PATH is None:
+        st.error("No dataset found. Upload a CSV via the sidebar or place 'Amazon Sale Report.csv' in e-commerce-analytics/dataset/.")
+        st.stop()
+
+    # Initialize data and sqlite db connection from default file
+    raw_data, connection = get_master_connection(str(DATA_PATH))
 
 min_date = raw_data["order_date"].min().date()
 max_date = raw_data["order_date"].max().date()
